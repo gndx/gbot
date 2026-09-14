@@ -1,0 +1,3 @@
+-r requirements.txt
+# Desktop renderer previews and reproducible Inter bitmap generation.
+Pillow==12.3.0

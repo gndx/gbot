@@ -1,0 +1,1339 @@
+#!/usr/bin/env python3
+"""GBOT: control a Waveshare RP2040 desktop companion over USB serial.
+
+The host CLI uses the Python standard library on macOS and Linux. Network
+integrations are optional; availability states work entirely offline.
+"""
+
+import datetime
+from decimal import Decimal, InvalidOperation
+import errno
+import fcntl
+import hashlib
+import glob
+import json
+import math
+import os
+import select
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+import unicodedata
+
+STATES = ("busy", "hold", "await", "open")
+
+# Keep aliases aligned with firmware/palette.py.
+ALIASES = {
+    "red": "busy", "dnd": "busy",
+    "yellow": "hold", "amarillo": "hold", "brb": "hold", "soon": "hold",
+    "focus": "await", "blue": "await", "wait": "await",
+    "green": "open", "free": "open", "talk": "open",
+}
+CACHE = os.path.expanduser("~/.config/gbot/device")
+LOCK_DIR = os.path.expanduser("~/.config/gbot/locks")
+PORT_LOCK_TIMEOUT = 3.0
+_PORT_LOCKS = {}
+TIMEOUT = 2.0
+CALENDAR_CONFIG = os.path.expanduser("~/.config/gbot/calendar.json")
+CALENDAR_READER = os.path.expanduser("~/Applications/GBOT Calendar.app/Contents/MacOS/gbot-calendar")
+
+COLOR = {"busy": "\033[31m", "hold": "\033[33m",
+         "await": "\033[34m", "open": "\033[32m"}
+DIM = "\033[2m"
+BOLD = "\033[1m"
+OFF = "\033[0m"
+
+USAGE = """usage: gbot [options] <command>
+
+Availability:
+  open                green: available to talk
+  await               blue: focused, but available
+  hold                yellow: temporarily busy
+  busy                red: do not disturb
+  next                cycle open -> await -> hold -> busy
+
+Display:
+  face                return to animated eyes and automatic information cards
+  view [face|hud|limits|weather|trm|calendar]
+  bright <0-100>      set display brightness
+  rotate <0-3>        rotate in 90-degree steps
+  sleep | wake       turn the display off or on
+  press [short|long]  simulate BOOT: change state or switch view
+  tap                show accelerometer gesture diagnostics
+
+Optional host integrations:
+  claude | codex      refresh and show one account's remaining usage
+  weather            refresh and show Medellin weather
+  weather terminal   show weather in the terminal without a board
+  weather status     read weather already stored on the board
+  trm [terminal|view|status]  Colombian USD/COP reference exchange rate
+  calendar           show the next Apple Calendar meeting for two minutes
+  calendar connect   install/authorize the optional macOS Calendar reader
+  calendar terminal  show the next meeting without a board
+  calendar calendars list available Apple calendars
+  calendar status    read the board's saved meeting
+  feed | sync        refresh integrations without changing the current view
+  feed --watch 60    repeat; weather every 10 min, TRM hourly or at expiry
+
+Usage dashboards:
+  limits             read saved account pages
+  limits --live      fetch Claude and Codex usage
+  limits --demo      send synthetic demonstration data
+  limits --clear     clear account pages
+  limits page [next|<n>]    select a saved account (zero-based index)
+  limits ACCOUNT LABEL,PERCENT_REMAINING[,RESET_SECONDS] ...
+    example: gbot limits CLAUDE 5H,84,1830 7D,89,432000
+
+Connection:
+  status             show state, view, temperature, voltage, and frame rate
+  ping               check the USB connection
+  devices            list candidate serial ports
+  -d, --device PATH  use an explicit port instead of automatic discovery
+  -a, --all          send basic display/state commands to all candidate boards
+  --watch SECONDS    repeat limits, claude, codex, or feed refreshes
+  -h, --help         show this help
+
+Full usage, weather, and TRM views return to the face after 60 awake seconds.
+Apple Calendar and Claude Keychain access require macOS. See docs/usage.md.
+"""
+
+
+# Remaining-percentage thresholds shared with the display.
+LIMIT_WARN = 50
+LIMIT_CRIT = 20
+
+# Optional, undocumented usage endpoints used by provider clients. They can
+# change without notice. Read existing local credentials, send them only to
+# their provider, and never print or persist tokens in GBOT state.
+CLAUDE_USAGE = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_BETA = "oauth-2025-04-20"
+CLAUDE_KEYCHAIN = "Claude Code-credentials"
+CODEX_USAGE = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_AUTH = "~/.codex/auth.json"
+CLAUDE_RETRY_FILE = os.path.expanduser("~/.config/gbot/claude-retry.json")
+CLAUDE_BACKOFF = 600
+CLAUDE_BACKOFF_MAX = 3600
+
+# Public Open-Meteo data for Medellin. Use UTC epoch seconds on the wire.
+# For a different city, update these coordinates and the matching display label.
+WEATHER_URL = (
+    "https://api.open-meteo.com/v1/forecast?latitude=6.2442&longitude=-75.5812"
+    "&current=temperature_2m,relative_humidity_2m,weather_code"
+    "&temperature_unit=celsius&timeformat=unixtime&timezone=UTC&forecast_days=1"
+)
+WEATHER_REFRESH = 600
+BOGOTA = datetime.timezone(datetime.timedelta(hours=-5))
+TRM_URL = "https://www.datos.gov.co/resource/ceyp-9c7c.json"
+TRM_REFRESH = 3600
+WMO_CODES = frozenset((0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63,
+                       65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86,
+                       95, 96, 99))
+
+
+def calendar_settings():
+    try:
+        with open(CALENDAR_CONFIG) as source:
+            settings = json.load(source)
+        if not isinstance(settings, dict) or not isinstance(settings.get("calendars", []), list):
+            return {}
+        if any(not isinstance(value, str) for value in settings.get("calendars", [])):
+            return {}
+        return settings
+    except (OSError, ValueError):
+        return {}
+
+
+def calendar_reader(action, calendars=()):
+    if not os.path.isfile(CALENDAR_READER):
+        return None, "Calendar: run gbot calendar connect to install the Apple Calendar reader"
+    try:
+        # LaunchServices gives GBOT Calendar a stable permission identity.
+        # Direct execution inherits terminal permissions and fails under launchd.
+        app = os.path.dirname(os.path.dirname(os.path.dirname(CALENDAR_READER)))
+        with tempfile.TemporaryDirectory(prefix="gbot-calendar-") as folder:
+            output = os.path.join(folder, "result.json")
+            result = subprocess.run(["/usr/bin/open", "-g", "-j", "-W", "-n", app,
+                                     "--args", action, *calendars, "--output", output],
+                                    capture_output=True, text=True,
+                                    timeout=180 if action == "authorize" else 20)
+            with open(output) as source:
+                data = json.load(source)
+        if not isinstance(data, dict):
+            raise ValueError()
+        if result.returncode or data.get("error"):
+            if data.get("authorization"):
+                return None, ("Calendar: macOS Calendar access is missing; run "
+                              "gbot calendar connect and grant access")
+            return None, "Calendar: could not read the selected calendar"
+        return data, None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, "Calendar: the Apple Calendar reader did not respond"
+
+
+def fetch_calendar():
+    settings = calendar_settings()
+    if not settings.get("enabled"):
+        return None, None
+    data, problem = calendar_reader("next", settings.get("calendars", []))
+    if problem:
+        return None, problem
+    event = data.get("event")
+    if event is None:
+        return {}, None  # A successful empty query clears any cancelled meeting.
+    try:
+        start = event["start"]
+        clock = event["time"]
+        if (type(start) is not int or not 0 < start - time.time() <= 7 * 86400
+                or not isinstance(event["id"], str) or not isinstance(event["title"], str)
+                or not isinstance(clock, str) or len(clock) != 5 or clock[2] != ":"
+                or not clock[:2].isdigit() or not clock[3:].isdigit()
+                or not 0 <= int(clock[:2]) <= 23 or not 0 <= int(clock[3:]) <= 59):
+            raise ValueError()
+        key = hashlib.sha256((event["id"] + ":" + str(start)).encode()).hexdigest()[:16]
+        return {"id": key, "start": start, "time": clock,
+                "title": event["title"] or "Meeting"}, None
+    except (KeyError, TypeError, ValueError):
+        return None, "Calendar: invalid data for the next meeting"
+
+
+def calendar_payload(event):
+    seconds = math.ceil(event["start"] - time.time()) if event else 0
+    if seconds <= 0:
+        return "calendar clear"
+    # Normalize to the font subset and prevent event-title newlines from
+    # injecting additional USB commands.
+    title = unicodedata.normalize("NFKD", event["title"]).encode("ascii", "ignore").decode()
+    title = " ".join("".join(c if c.isalnum() or c in " .:%-/" else " "
+                             for c in title).split())[:48] or "Meeting"
+    return "calendar set %s %d %s %s" % (event["id"], seconds, event["time"], title)
+
+
+def calendar_command(device=None, action=None):
+    if action == "connect":
+        if not os.path.isfile(CALENDAR_READER):
+            script = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                  "scripts", "install-calendar.sh")
+            subprocess.run(["bash", script], check=True)
+        data, problem = calendar_reader("authorize")
+        if problem:
+            fail(problem)
+        if data.get("authorization") != "authorized":
+            fail("Calendar: macOS Calendar permission is missing")
+        settings = dict(calendar_settings(), enabled=True, source="apple")
+        os.makedirs(os.path.dirname(CALENDAR_CONFIG), exist_ok=True)
+        fd = os.open(CALENDAR_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as output:
+            json.dump(settings, output)
+        print("Apple Calendar connected. With gbot feed running, alerts start 5 min before and last 2 min.")
+        return 0
+    if action == "calendars":
+        data, problem = calendar_reader("calendars")
+        if problem:
+            fail(problem)
+        for calendar in data.get("calendars", []):
+            print("%s  %s / %s" % (calendar["id"], calendar["source"], calendar["title"]))
+        return 0
+    if action == "status":
+        fd, _ = connect(device)
+        try:
+            print(limits_command(fd, "calendar"))
+        finally:
+            close_port(fd)
+        return 0
+    event, problem = fetch_calendar()
+    if problem or event is None:
+        fail(problem or "Calendar: first connect Apple Calendar with gbot calendar connect")
+    if event:
+        print("Calendar\n%s\n%s" % (event["time"], event["title"]))
+    else:
+        print("Calendar: no meetings in the next 7 days.")
+    if action != "terminal":
+        fd, _ = connect(device)
+        try:
+            limits_command(fd, calendar_payload(event))
+            limits_command(fd, "view calendar")
+            limits_command(fd, "wake")
+        finally:
+            close_port(fd)
+    return 0
+
+
+def fetch_weather():
+    """Fetch current Medellin weather as (data, None) or (None, error); no credentials."""
+    code, data = _get_json(WEATHER_URL, {"Accept": "application/json",
+                                         "User-Agent": "gbot"}, timeout=10)
+    if code != 200 or not isinstance(data, dict):
+        return None, "weather: Open-Meteo unavailable (HTTP %s)" % (code or "offline")
+    current, units = data.get("current"), data.get("current_units")
+    if not isinstance(current, dict) or not isinstance(units, dict):
+        return None, "weather: response has no current conditions"
+    expected = {"temperature_2m": "°C", "relative_humidity_2m": "%",
+                "weather_code": "wmo code", "time": "unixtime"}
+    if any(units.get(key) != unit for key, unit in expected.items()):
+        return None, "weather: unexpected units; expected Celsius and UNIX time"
+    values = [current.get(key) for key in expected]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) for value in values):
+        return None, "weather: incomplete or invalid current conditions"
+    temp, humidity, weather_code, observed = values
+    if (not -90 <= temp <= 60 or not 0 <= humidity <= 100
+            or humidity != int(humidity) or weather_code not in WMO_CODES
+            or observed != int(observed) or not 0 <= time.time() - observed <= 2700):
+        return None, "weather: conditions out of range or observation is stale"
+    return {"temp_tenths": int(round(temp * 10)), "code": int(weather_code),
+            "humidity": int(humidity), "observed_epoch": int(observed)}, None
+
+
+def weather_payload(data):
+    return "weather set %d %d %d %d" % (
+        data["temp_tenths"], data["code"], data["humidity"], data["observed_epoch"])
+
+
+def print_weather(data):
+    local = datetime.datetime.fromtimestamp(data["observed_epoch"], BOGOTA)
+    print("Medellín  %.1f °C  ·  Humidity %d%%\n"
+          "Updated: %s (Colombia)  ·  Open-Meteo" %
+          (data["temp_tenths"] / 10, data["humidity"], local.strftime("%d/%m/%Y %H:%M")))
+
+
+def clima_command(device=None, terminal_only=False):
+    if not terminal_only:
+        return weather_command(device)
+    data, problem = fetch_weather()
+    if problem:
+        fail(problem)
+    print_weather(data)
+    return 0
+
+
+def fetch_trm():
+    """Fetch the Colombian reference rate in integer COP cents per USD."""
+    from urllib.parse import urlencode
+    today = datetime.datetime.fromtimestamp(time.time(), BOGOTA).date()
+    date = today.isoformat() + "T00:00:00"
+    query = urlencode({"$limit": 1, "$order": "vigenciadesde DESC",
+                       "$where": "vigenciadesde <= '%s' AND vigenciahasta >= '%s'" %
+                       (date, date)})
+    status, rows = _get_json(TRM_URL + "?" + query,
+                             {"Accept": "application/json", "User-Agent": "gbot"}, timeout=10)
+    if status != 200 or not isinstance(rows, list):
+        return None, "TRM: datos.gov.co unavailable (HTTP %s)" % (status or "offline")
+    if not rows:
+        return None, "TRM: no rate valid for today in datos.gov.co"
+    try:
+        row = rows[0]
+        amount = Decimal(str(row["valor"]))
+        start = datetime.date.fromisoformat(row["vigenciadesde"][:10])
+        end = datetime.date.fromisoformat(row["vigenciahasta"][:10])
+        if (not amount.is_finite() or not Decimal("0.01") <= amount <= Decimal("99999.99")
+                or amount * 100 != (amount * 100).to_integral_value()
+                or not start <= today <= end or (end - start).days > 31):
+            raise ValueError("invalid value or validity period")
+        expires = datetime.datetime.combine(end + datetime.timedelta(days=1),
+                                              datetime.time(), BOGOTA).timestamp()
+        remaining = int(expires - time.time())
+        if remaining <= 0:
+            return None, "TRM: validity changed during the request; try again"
+        return {"cents": int(amount * 100), "from_day": int(start.strftime("%Y%m%d")),
+                "to_day": int(end.strftime("%Y%m%d")), "valid_for": remaining}, None
+    except (KeyError, IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
+        return None, "TRM: response has an invalid value or validity period"
+
+
+def cop_amount(cents):
+    whole, fraction = divmod(cents, 100)
+    return format(whole, ",").replace(",", ".") + ",%02d" % fraction
+
+
+def trm_payload(data):
+    return "trm set %d %d %d %d" % (data["cents"], data["from_day"],
+                                     data["to_day"], data["valid_for"])
+
+
+def print_trm(data):
+    def date(day):
+        return "%02d/%02d/%04d" % (day % 100, day // 100 % 100, day // 10000)
+    validity = date(data["from_day"])
+    if data["from_day"] != data["to_day"]:
+        validity += " to " + date(data["to_day"])
+    print("TRM  ·  1 USD = $%s COP\nValid: %s (Colombia)\n"
+          "Source: Superintendencia Financiera · datos.gov.co" % (cop_amount(data["cents"]), validity))
+
+
+def trm_command(device=None, action=None):
+    if action == "status":
+        fd, dev = connect(device)
+        try:
+            print(limits_command(fd, "trm"))
+        finally:
+            close_port(fd)
+        return 0
+    data, problem = fetch_trm()
+    if problem:
+        fail(problem)
+    if action != "terminal":
+        fd, dev = connect(device)
+        try:
+            limits_command(fd, trm_payload(data))
+            limits_command(fd, "view trm")
+            limits_command(fd, "wake")
+        finally:
+            close_port(fd)
+    print_trm(data)
+    return 0
+
+
+def weather_command(device=None, status_only=False):
+    """Check the board weather capability before making a network request."""
+    fd, dev = connect(device)
+    try:
+        reply = limits_command(fd, "weather")
+    finally:
+        close_port(fd)
+    if status_only or parse_status(reply).get("source") != "host":
+        print("%s   (%s)" % (reply, dev))
+        return 0
+    data, problem = fetch_weather()
+    if problem:
+        fail(problem)
+    # Release the USB port while HTTP is in progress.
+    fd, dev = connect(dev)
+    try:
+        limits_command(fd, weather_payload(data))
+        limits_command(fd, "view weather")
+        limits_command(fd, "wake")
+    finally:
+        close_port(fd)
+    print_weather(data)
+    return 0
+
+
+def feed_snapshot(with_weather=True):
+    """Fetch each provider independently while the USB port is closed."""
+    pages, problems = [], []
+    for name, fetch in (("Claude", claude_usage), ("Codex", codex_usage)):
+        try:
+            title, result = fetch()
+            if title:
+                pages.append((title, result))
+            else:
+                problems.append(result)
+        except Exception:
+            problems.append("%s: invalid response" % name)
+    weather = None
+    if with_weather:
+        try:
+            weather, problem = fetch_weather()
+            if problem:
+                problems.append(problem)
+        except Exception:
+            problems.append("clima: invalid response")
+    return pages, weather, problems
+
+
+def push_feed(device, pages, weather, trm=None, calendar=None):
+    """Update data while preserving the view, page, brightness, sleep, and state."""
+    fd, dev = connect(device)
+    successes, problems = [], []
+    try:
+        commands = [(title, payload) for title, windows in pages
+                    for payload in page_payloads([(title, windows)])]
+        if weather:
+            reply = talk(fd, "weather")
+            if reply and parse_status(reply).get("source") == "host":
+                commands.append(("Medellin", weather_payload(weather)))
+            else:
+                problems.append("weather: board does not support host-fed data")
+        if trm:
+            commands.append(("TRM", trm_payload(trm)))
+        if calendar is not None:
+            commands.append(("Calendar", calendar_payload(calendar)))
+        for label, command in commands:
+            reply = talk(fd, command)
+            if reply and reply.startswith("ok"):
+                successes.append(label)
+            else:
+                problems.append("%s: board did not acknowledge the update" % label)
+    finally:
+        close_port(fd)
+    return successes, problems, dev
+
+
+def watch_feed(device=None, watch=0):
+    """Sync once or continuously, recovering when USB reconnects."""
+    next_weather = 0
+    next_trm, trm_expires, cached_trm = 0, 0, None
+    while True:
+        started = time.monotonic()
+        with_weather = started >= next_weather
+        pages, weather, problems = feed_snapshot(with_weather)
+        if with_weather:
+            next_weather = started + WEATHER_REFRESH
+        if time.monotonic() >= next_trm:
+            try:
+                trm, problem = fetch_trm()
+            except Exception:
+                trm, problem = None, "TRM: invalid response"
+            if trm:
+                cached_trm = trm
+                trm_expires = time.monotonic() + trm["valid_for"]
+                next_trm = min(time.monotonic() + TRM_REFRESH, trm_expires)
+            else:
+                next_trm = time.monotonic() + 300
+                problems.append(problem)
+        trm = None
+        if cached_trm and trm_expires > time.monotonic():
+            trm = dict(cached_trm, valid_for=int(trm_expires - time.monotonic()))
+            if trm["valid_for"] <= 0:
+                trm = None
+        calendar, calendar_problem = fetch_calendar()
+        if calendar_problem:
+            problems.append(calendar_problem)
+        successes = []
+        if pages or weather or trm or calendar is not None:
+            try:
+                if calendar is None:
+                    successes, board_problems, dev = push_feed(device, pages, weather, trm)
+                else:
+                    successes, board_problems, dev = push_feed(device, pages, weather, trm, calendar)
+                problems.extend(board_problems)
+                if successes:
+                    print("gbot feed: %s updated (%s)" % (", ".join(successes), dev))
+            except (OSError, SystemExit):
+                problems.append("USB: unavailable; retrying next cycle")
+                # Refresh weather promptly after a USB reconnect.
+                next_weather = 0
+        for problem in problems:
+            print("gbot feed: " + str(problem), file=sys.stderr)
+        if not watch:
+            return 0 if successes else 1
+        time.sleep(max(1, watch - (time.monotonic() - started)))
+
+
+def limit_tone(pct):
+    """Choose green, amber, or red from the remaining percentage."""
+    if pct >= LIMIT_WARN:
+        return "\033[32m"
+    return "\033[33m" if pct >= LIMIT_CRIT else "\033[31m"
+
+
+def human_reset(secs):
+    """Format short and multi-day reset countdowns."""
+    if secs < 0:
+        return "reset --"
+    if secs >= 86400:
+        return "reset %dd %dh" % (secs // 86400, secs % 86400 // 3600)
+    if secs >= 3600:
+        return "reset %dh %02dm" % (secs // 3600, secs % 3600 // 60)
+    return "reset %02d:%02d" % (secs // 60, secs % 60)
+
+
+def window_label(seconds):
+    """Build a compact usage-window label from its duration."""
+    if not seconds:
+        return "WIN"
+    hours = seconds // 3600
+    if hours >= 24 and hours % 24 == 0:
+        return "%dD" % (hours // 24)
+    return "%dH" % hours if hours else "%dM" % (seconds // 60)
+
+
+def _get_json(url, headers, timeout=20):
+    """Return (HTTP status, JSON data); a missing status means a network error."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            if exc.code == 429:
+                return exc.code, {"retry_after": exc.headers.get("Retry-After")
+                                  if exc.headers else None}
+            return exc.code, None
+        finally:
+            exc.close()
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _until(iso):
+    """Seconds until an ISO 8601 timestamp, or -1 when unavailable."""
+    if not iso:
+        return -1
+    try:
+        when = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return -1
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    left = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    return int(left) if left > 0 else 0
+
+
+class UsageDeferred(str):
+    """Recoverable fetch failure: an existing board snapshot may still be shown."""
+
+
+def _claude_retry_state():
+    try:
+        with open(CLAUDE_RETRY_FILE) as source:
+            state = json.load(source)
+        deadline, failures = state["retry_at"], state["failures"]
+        if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                or not math.isfinite(deadline) or deadline < 0
+                or type(failures) is not int or not 0 <= failures <= 10):
+            return {"retry_at": 0, "failures": 0}
+        return {"retry_at": deadline, "failures": failures}
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return {"retry_at": 0, "failures": 0}
+
+
+def _save_claude_retry(state):
+    # Store only the retry deadline and count, never provider data or tokens.
+    folder = os.path.dirname(CLAUDE_RETRY_FILE)
+    fd, temporary = tempfile.mkstemp(prefix=".claude-retry-", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(state, output)
+        os.replace(temporary, CLAUDE_RETRY_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _retry_after_seconds(value):
+    """Parse Retry-After as seconds or a UTC HTTP date."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return max(1, int(value))
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        return max(1, math.ceil(when.timestamp() - time.time()))
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _claude_pause(seconds):
+    wait = ("%d min" % math.ceil(seconds / 60) if seconds >= 60
+            else "%d s" % math.ceil(seconds))
+    return UsageDeferred("claude: requests paused after HTTP 429; "
+                         "next attempt in " + wait)
+
+
+def claude_usage():
+    """Share request backoff between the CLI, watch mode, and background feed."""
+    try:
+        os.makedirs(os.path.dirname(CLAUDE_RETRY_FILE), mode=0o700, exist_ok=True)
+        fd = os.open(CLAUDE_RETRY_FILE + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None, UsageDeferred("claude: another request is already in progress")
+            state = _claude_retry_state()
+            remaining = state["retry_at"] - time.time()
+            if remaining > 0:
+                return None, _claude_pause(remaining)
+            return _fetch_claude_usage(state)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None, UsageDeferred("claude: could not coordinate the local request")
+
+
+def _fetch_claude_usage(retry_state):
+    """Fetch Claude Code usage using its existing macOS Keychain entry.
+
+    The first Keychain read may request permission. Tokens stay on the host
+    and are sent only to the provider endpoint."""
+    try:
+        out = subprocess.run(["security", "find-generic-password",
+                              "-s", CLAUDE_KEYCHAIN, "-w"],
+                             capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        return None, "claude: cannot read the macOS Keychain (%s)" % exc
+    if out.returncode != 0:
+        return None, "claude: no credentials in the macOS Keychain"
+    try:
+        token = json.loads(out.stdout)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None, "claude: the Keychain item does not contain the expected token"
+
+    code, data = _get_json(CLAUDE_USAGE, {
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": CLAUDE_BETA,
+        "User-Agent": "gbot",
+        "Accept": "application/json",
+    })
+    if code == 429:
+        failures = min(10, retry_state["failures"] + 1)
+        delay = _retry_after_seconds(data.get("retry_after")) if isinstance(data, dict) else None
+        if delay is None:
+            delay = min(CLAUDE_BACKOFF_MAX, CLAUDE_BACKOFF * 2 ** (failures - 1))
+        _save_claude_retry({"retry_at": time.time() + delay, "failures": failures})
+        return None, _claude_pause(delay)
+    if code == 401:
+        return None, ("claude: token expired; open `claude` once "
+                      "to refresh it")
+    if code != 200 or not isinstance(data, dict):
+        return None, "claude: endpoint returned %s" % (code or data)
+
+    # Prefer normalized limits, falling back to five_hour/seven_day fields.
+    # Show session and overall weekly windows; omit model-specific windows
+    # to keep the small display readable.
+    kinds = {"session": "5H", "weekly_all": "7D"}
+    windows = []
+    for entry in data.get("limits") or []:
+        pct = entry.get("percent")
+        label = kinds.get(entry.get("kind") or "")
+        if pct is None or label is None:
+            continue
+        windows.append((label, 100 - int(round(pct)),
+                        _until(entry.get("resets_at"))))
+    if not windows:
+        for key, label in (("five_hour", "5H"), ("seven_day", "7D")):
+            win = data.get(key)
+            if isinstance(win, dict) and win.get("utilization") is not None:
+                windows.append((label,
+                                100 - int(round(win["utilization"])),
+                                _until(win.get("resets_at"))))
+    if not windows:
+        return None, "claude: endpoint returned no usage windows"
+    _save_claude_retry({"retry_at": 0, "failures": 0})
+    return "CLAUDE", windows
+
+
+def codex_usage():
+    """Fetch Codex usage using the existing ~/.codex/auth.json login."""
+    path = os.path.expanduser(CODEX_AUTH)
+    if not os.path.exists(path):
+        return None, "codex: missing %s" % CODEX_AUTH
+    try:
+        tokens = json.load(open(path)).get("tokens") or {}
+    except Exception as exc:
+        return None, "codex: cannot read auth.json (%s)" % exc
+    token, account = tokens.get("access_token"), tokens.get("account_id")
+    if not token or not account:
+        return None, "codex: auth.json is missing access_token or account_id"
+
+    code, data = _get_json(CODEX_USAGE, {
+        "Authorization": "Bearer " + token,
+        "ChatGPT-Account-Id": account,
+        "User-Agent": "gbot",
+        "Accept": "application/json",
+    })
+    if code == 401:
+        return None, ("codex: token expired; open `codex` once "
+                      "to refresh it")
+    if code != 200 or not isinstance(data, dict):
+        return None, "codex: endpoint returned %s" % (code or data)
+
+    rl = data.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        win = rl.get(key)
+        if not isinstance(win, dict) or win.get("used_percent") is None:
+            continue
+        secs = win.get("reset_after_seconds")
+        windows.append((window_label(win.get("limit_window_seconds")),
+                        100 - int(round(win["used_percent"])),
+                        int(secs) if secs is not None else -1))
+    if not windows:
+        return None, "codex: endpoint returned no usage windows"
+    return "CODEX", windows
+
+
+def live_pages(provider=None):
+    """Fetch one selected provider or both, returning (pages, problems)."""
+    pages = []
+    problems = []
+    providers = {"claude": claude_usage, "codex": codex_usage}
+    fetchers = (providers[provider],) if provider else providers.values()
+    for fetch in fetchers:
+        title, result = fetch()
+        if title:
+            pages.append((title, result))
+        else:
+            problems.append(result)
+    return pages, problems
+
+
+def demo_pages(step):
+    """Generate two synthetic usage pages covering thresholds and countdowns."""
+    a = 100 - (step * 4) % 101
+    b = 100 - (step * 9) % 101
+    return [("CLAUDE", [("5H", a, 1800 - (step * 4) % 1800),
+                        ("7D", (a + 30) % 101, 432000)]),
+            ("CODEX", [("7D", b, 326877 - (step * 60) % 326877)])]
+
+
+def parse_windows(specs):
+    """Validate LABEL,PERCENT[,SECONDS] before sending data to the board."""
+    windows = []
+    for spec in specs:
+        f = spec.split(",")
+        if len(f) < 2 or not f[0]:
+            fail("invalid window: " + spec,
+                 "use LABEL,PERCENT_REMAINING[,SECONDS], e.g. 5H,84,1830")
+        try:
+            pct = int(f[1])
+            secs = int(f[2]) if len(f) > 2 and f[2] else -1
+        except ValueError:
+            fail("percentage and seconds must be integers: " + spec)
+        if not 0 <= pct <= 100:
+            fail("percentage means REMAINING, from 0 to 100: " + spec)
+        windows.append((f[0], pct, secs))
+    if not windows:
+        fail("format: gbot limits ACCOUNT LABEL,PERCENT[,SECONDS] ...",
+             "for example gbot limits CLAUDE 5H,84,1830 7D,89,432000")
+    return windows
+
+
+def page_payloads(pages):
+    """Encode pages as limits commands for the USB serial protocol."""
+    out = []
+    for title, windows in pages:
+        parts = []
+        for label, pct, secs in windows[:3]:
+            pct = 0 if pct < 0 else (100 if pct > 100 else pct)
+            piece = "%s,%d" % (str(label)[:4], pct)
+            if secs is not None and secs >= 0:
+                piece += ",%d" % secs
+            parts.append(piece)
+        if parts:
+            out.append("limits %s %s" % (str(title)[:8], " ".join(parts)))
+    return out
+
+
+def parse_pages(reply):
+    """Decode board reports containing ACCOUNT:LABEL,PERCENT,SECONDS records."""
+    tokens = reply[3:].split()
+    info = dict(t.split("=", 1) for t in tokens if "=" in t and ":" not in t)
+    pages = []
+    for t in tokens:
+        if ":" not in t:
+            continue
+        title, _, rest = t.partition(":")
+        windows = []
+        for win in rest.split(";"):
+            f = win.split(",")
+            if len(f) >= 2:
+                windows.append((f[0], int(f[1]),
+                                int(f[2]) if len(f) > 2 else -1))
+        pages.append((title, windows))
+    return pages, info
+
+
+def show_limits(reply, account=None):
+    """Render terminal meters with the same thresholds as the board."""
+    pages, info = parse_pages(reply)
+    if not pages:
+        print(DIM + "the board has no usage pages; "
+              "try `gbot limits --live`" + OFF)
+        return
+    active = int(info.get("page", 0))
+    for n, (title, windows) in enumerate(pages):
+        if account and title != account:
+            continue
+        mark = paint(" <", "\033[36m") if n == active else ""
+        print(" " + BOLD + title + OFF + mark)
+        for label, pct, secs in windows:
+            filled = round(pct * 14 / 100)
+            bar = (paint("#" * filled, limit_tone(pct))
+                   + DIM + "." * (14 - filled) + OFF)
+            print("   %-5s %s %s%3d%%%s   %s%s%s"
+                  % (label, bar, BOLD, pct, OFF, DIM, human_reset(secs), OFF))
+    age = info.get("age")
+    # Report age is the oldest account; it does not describe a single
+    # account that was just refreshed.
+    if account is None and age is not None and int(age) > 300:
+        print(DIM + " data is %ss old: the board needs a host refresh" % age
+              + OFF)
+
+
+def limits_command(fd, command="limits"):
+    """Require an acknowledged board command before proceeding."""
+    reply = talk(fd, command)
+    if reply is None:
+        fail("board did not respond to `%s`" % command)
+    if reply.startswith("err"):
+        fail("board rejected `%s`: %s" % (command, reply[4:].strip()))
+    return reply
+
+
+def limits_once(fd, dev, demo, live, args, clear=False, provider=None,
+                live_result=None, step=0):
+    """Send and read back account pages in one USB transaction.
+
+    The RP2040 has no radio; a host refresh supplies all network data.
+    Without live/demo/input arguments, this operation only reads saved data.
+    Readback reports the values stored by the board and its running countdown."""
+    if provider:
+        # Probe support before reading credentials or changing the display.
+        limits_command(fd)
+    elif (demo or live) and step == 0:
+        talk(fd, "view limits")
+    pushes = []
+    cached = False
+    if clear:
+        pushes = ["limits clear"]
+    elif live:
+        pages, problems = live_result if live_result is not None else live_pages(provider)
+        for note in problems:
+            print(paint("! ", "\033[33m") + note)
+        if not pages:
+            if provider and any(isinstance(note, UsageDeferred) for note in problems):
+                stored, _ = parse_pages(limits_command(fd))
+                cached = any(title == provider.upper() and windows
+                             for title, windows in stored)
+                if not cached:
+                    fail("no cached data for " + provider.upper(),
+                         "current view preserved; try again after the pause")
+                print("Showing cached %s data; refresh was unavailable."
+                      % provider.upper())
+            else:
+                fail("could not read usage for any account")
+        pushes = page_payloads(pages)
+    elif demo:
+        pushes = page_payloads(demo_pages(step))
+    elif args and args[0] == "page":
+        # Select the account without overwriting its values.
+        pushes = ["limits page " + (args[1] if len(args) > 1 else "next")]
+    elif args:
+        pushes = page_payloads([(args[0], parse_windows(args[1:]))])
+    for push in pushes:
+        limits_command(fd, push)
+    reply = limits_command(fd)
+    account = provider.upper() if provider else None
+    if account:
+        board_pages, _ = parse_pages(reply)
+        index = next((n for n, (title, _) in enumerate(board_pages)
+                      if title == account), None)
+        if index is None:
+            fail("board did not save account " + account)
+        if step == 0:
+            limits_command(fd, "limits page %d" % index)
+            limits_command(fd, "view limits")
+            limits_command(fd, "wake")
+            reply = limits_command(fd)
+    print(paint("*", "\033[36m") + " limits (% remaining)" +
+          (" [CACHED DATA]" if cached else "") + DIM +
+          "   " + dev + OFF)
+    show_limits(reply, account)
+    return 0
+
+
+def watch_limits(device, demo, live, watch, args, clear=False, provider=None):
+    """Release USB during HTTP and delays so display commands can share the port."""
+    if provider:
+        # Check firmware capability before consulting account credentials.
+        fd, device = connect(device)
+        try:
+            limits_command(fd)
+        finally:
+            close_port(fd)
+    step = 0
+    while True:
+        live_result = live_pages(provider) if live and not clear else None
+        fd, device = connect(device)
+        try:
+            limits_once(fd, device, demo, live, args, clear, provider,
+                        live_result=live_result, step=step)
+        finally:
+            close_port(fd)
+        step += 1
+        if not watch:
+            return 0
+        time.sleep(watch)
+
+
+def paint(text, code):
+    return text if not sys.stdout.isatty() else code + text + OFF
+
+
+def fail(msg, hint=None):
+    sys.stderr.write(paint("x ", "\033[31m") + msg + "\n")
+    if hint:
+        sys.stderr.write(DIM + "  " + hint + OFF + "\n")
+    raise SystemExit(1)
+
+
+# --- serial transport -----------------------------------------------------
+
+def candidates():
+    """List native USB CDC candidates on macOS and Linux.
+
+    An explicit -d path supports other POSIX device names. Discovery does not
+    open ports; connect() probes candidates with ping before caching one."""
+    found = glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/ttyACM*")
+    return sorted(found)
+
+
+def _acquire_port_lock(dev, timeout=PORT_LOCK_TIMEOUT):
+    """Coordinate GBOT processes before opening or flushing a serial port."""
+    os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(LOCK_DIR, os.path.basename(dev))
+    lock = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OSError(errno.EBUSY,
+                                  "port busy with another GBOT command; try again", dev)
+                time.sleep(min(0.05, remaining))
+    except BaseException:
+        os.close(lock)
+        raise
+
+
+def close_port(fd):
+    """Close USB and release its lock even if the device disappears."""
+    lock = _PORT_LOCKS.pop(fd, None)
+    try:
+        os.close(fd)
+    finally:
+        if lock is not None:
+            os.close(lock)  # Closing the final reference releases flock.
+
+
+def open_port(dev):
+    lock = _acquire_port_lock(dev)
+    fd = None
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        _PORT_LOCKS[fd] = lock
+        tty.setraw(fd)
+        # Set conventional 115200 settings for USB serial.
+        attrs = termios.tcgetattr(fd)
+        attrs[4] = attrs[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        settle(fd)
+        return fd
+    except BaseException:
+        if fd is None:
+            os.close(lock)
+        else:
+            close_port(fd)
+        raise
+
+
+def settle(fd, timeout=3.0, quiet=0.35):
+    """Wait for a ready greeting or a short quiet interval after opening USB."""
+    end = time.monotonic() + timeout
+    last = time.monotonic()
+    buf = b""
+    while time.monotonic() < end:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if readable:
+            try:
+                chunk = os.read(fd, 256)
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                chunk = b""
+            if chunk:
+                buf += chunk
+                last = time.monotonic()
+                if b"ready" in buf:
+                    break
+        elif time.monotonic() - last > quiet:
+            break
+    termios.tcflush(fd, termios.TCIFLUSH)
+
+
+def talk(fd, command, timeout=TIMEOUT):
+    """Send a command and return the first ok/err response from the board."""
+    os.write(fd, (command + "\r\n").encode())
+    buf = b""
+    end = time.monotonic() + timeout
+    remaining = timeout
+    while remaining > 0:
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if ready:
+            try:
+                chunk = os.read(fd, 256)
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                chunk = b""
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip().decode("utf-8", "replace")
+                if line.startswith("ok") or line.startswith("err"):
+                    return line
+                if line.startswith(">>>") or "Traceback" in line:
+                    return "err board is at the REPL instead of running main.py"
+        remaining = end - time.monotonic()
+    return None
+
+
+def cached_device():
+    # Use only GBOT state; do not inherit a different project's device selection.
+    for cache in (CACHE,):
+        try:
+            with open(cache) as fh:
+                dev = fh.read().strip()
+            if dev and os.path.exists(dev):
+                return dev
+        except OSError:
+            continue
+    return None
+
+
+def remember(dev):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as fh:
+            fh.write(dev)
+    except OSError:
+        pass
+
+
+def connect(explicit=None):
+    """Return (fd, device) for the first board that acknowledges ping."""
+    if explicit:
+        order = [explicit]
+    else:
+        order = []
+        cached = cached_device()
+        if cached:
+            order.append(cached)
+        order += [d for d in candidates() if d != cached]
+
+    if not order:
+        fail("no connected board found",
+             "check the USB cable; `gbot devices` lists candidate ports")
+
+    last = None
+    for dev in order:
+        try:
+            fd = open_port(dev)
+        except OSError as exc:
+            last = "%s: %s" % (dev, exc.strerror)
+            continue
+        try:
+            reply = talk(fd, "ping", 1.2)
+        except BaseException:
+            close_port(fd)
+            raise
+        if reply == "ok pong":
+            remember(dev)
+            return fd, dev
+        close_port(fd)
+        last = "%s: %s" % (dev, reply or "no response")
+
+    fail("board did not respond", last)
+
+
+# --- commands -------------------------------------------------------------
+
+def parse_status(reply):
+    out = {}
+    for token in reply.split()[1:]:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            out[key] = value
+    return out
+
+
+def show_state(name, extra=""):
+    dot = paint("*", COLOR.get(name, ""))
+    print("%s %s%s%s%s" % (dot, BOLD, name, OFF, extra))
+
+
+def main(argv):
+    device = None
+    every = False
+    args = []
+    i = 0
+    watch = 0
+    demo = False
+    live = False
+    clear = False
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-a", "--all"):
+            every = True
+        elif arg in ("-d", "--device"):
+            i += 1
+            if i >= len(argv):
+                fail("--device requires a path")
+            device = argv[i]
+        elif arg == "--watch":
+            i += 1
+            if i >= len(argv):
+                fail("--watch requires seconds")
+            try:
+                watch = max(1, int(argv[i]))
+            except ValueError:
+                fail("--watch requires an integer number of seconds")
+        elif arg == "--demo":
+            demo = True
+        elif arg == "--live":
+            live = True
+        elif arg == "--clear":
+            clear = True
+        elif arg in ("-h", "--help"):
+            print(USAGE)
+            return 0
+        else:
+            args.append(arg)
+        i += 1
+
+    if args and args[0] == "devices":
+        found = candidates()
+        print("\n".join(found) if found else DIM + "no USB serial ports found" + OFF)
+        return 0
+
+    if not args:
+        args = ["status"]
+
+    cmd = args[0]
+    cmd = ALIASES.get(cmd, cmd)
+    args[0] = cmd
+    if cmd == "calendar":
+        if (every or len(args) > 2 or watch or demo or live or clear
+                or (len(args) == 2 and args[1] not in ("connect", "calendars", "status", "terminal"))):
+            fail("usage: gbot calendar [connect|calendars|status|terminal] [-d <port>]")
+        return calendar_command(device, args[1] if len(args) == 2 else None)
+    if cmd == "clima":
+        if every or args not in (["clima"], ["clima", "terminal"]) or watch or demo or live or clear:
+            fail("usage: gbot clima [terminal] [-d <port>]")
+        return clima_command(device, terminal_only=len(args) == 2)
+    if cmd == "trm":
+        if every or args not in (["trm"], ["trm", "view"], ["trm", "status"], ["trm", "terminal"]) or watch or demo or live or clear:
+            fail("usage: gbot trm [view|status|terminal] [-d <port>]")
+        return trm_command(device, args[1] if len(args) == 2 else None)
+    if cmd == "face":
+        if len(args) != 1:
+            fail("usage: gbot face")
+        cmd, args = "view", ["view", "face"]
+    if cmd in ("feed", "sync"):
+        if every or len(args) != 1 or demo or live or clear:
+            fail("usage: gbot feed [-d <port>] [--watch <seconds>]")
+        return watch_feed(device, watch)
+    if cmd == "weather":
+        if (every or args not in (["weather"], ["weather", "status"], ["weather", "terminal"])
+                or watch or demo or live or clear):
+            fail("usage: gbot weather [status|terminal] [-d <port>]")
+        if args == ["weather", "terminal"]:
+            return clima_command(device, terminal_only=True)
+        return weather_command(device, status_only=len(args) == 2)
+    provider = cmd if cmd in ("claude", "codex") else None
+    if provider:
+        if every:
+            fail("gbot %s uses one board; select it with -d <port>" % provider)
+        if len(args) != 1 or demo or clear:
+            fail("usage: gbot %s [-d <port>] [--watch <seconds>]" % provider)
+        cmd = "limits"
+        args = [cmd]
+        live = True
+    if cmd not in STATES and cmd not in ("status", "state", "next", "view",
+                                         "bright", "rotate", "sleep", "wake",
+                                         "ping", "tap", "weather",
+                                         "limits", "press"):
+        fail("unknown command: " + cmd, "try `gbot --help`")
+
+    if cmd == "limits":
+        payload = "limits"      # Single-board handling lives in limits_once.
+    else:
+        payload = " ".join(args)
+
+    if every:
+        found = candidates()
+        if not found:
+            fail("no connected board found")
+        ok = 0
+        for candidate in found:
+            try:
+                fd = open_port(candidate)
+            except OSError as exc:
+                print("%s%s: %s%s" % (DIM, candidate, exc.strerror, OFF))
+                continue
+            try:
+                answer = talk(fd, payload)
+            finally:
+                close_port(fd)
+            if answer and answer.startswith("ok"):
+                ok += 1
+                info = parse_status(answer)
+                show_state(info.get("state", cmd),
+                           "%s   %s%s" % (DIM, candidate, OFF))
+            else:
+                print("%s%s: %s%s" % (DIM, candidate, answer or "no response", OFF))
+        return 0 if ok else 1
+
+    if cmd == "limits" and (watch or provider):
+        return watch_limits(device, demo, live, watch, args[1:], clear, provider)
+    fd, dev = connect(device)
+    try:
+        if cmd == "limits":
+            return limits_once(fd, dev, demo, live, args[1:], clear, provider)
+        reply = talk(fd, payload)
+    finally:
+        close_port(fd)
+
+    if reply is None:
+        fail("board did not respond to `%s`" % payload)
+    if reply.startswith("err"):
+        fail(reply[4:].strip())
+
+    if cmd in STATES:
+        show_state(cmd)
+    elif cmd == "next":
+        show_state(parse_status(reply).get("state", "?"))
+    elif cmd == "view":
+        print(paint("*", "\033[36m") + " view " + BOLD +
+              parse_status(reply).get("view", "?") + OFF)
+    elif cmd == "limits":
+        show_limits(reply)
+    elif cmd in ("status", "state"):
+        info = parse_status(reply)
+        # Show only fields reported by the firmware.
+        bits = []
+        if "view" in info:
+            bits.append(info["view"])
+        if "temp" in info:
+            bits.append(info["temp"] + " C")
+        if "volts" in info:
+            bits.append(info["volts"] + " V")
+        if "bright" in info:
+            bits.append("brightness " + info["bright"] + "%")
+        if "rot" in info:
+            bits.append("rotation " + info["rot"])
+        if "fps" in info:
+            bits.append(info["fps"] + " fps")
+        extra = "%s   %s%s" % (DIM, "   ".join(bits), OFF) if bits else ""
+        if info.get("sleep") == "1":
+            extra = "%s   display asleep%s" % (DIM, OFF)
+        show_state(info.get("state", "?"), extra)
+    else:
+        print(paint("ok ", "\033[32m") + reply[3:].strip() +
+              "%s   (%s)%s" % (DIM, dev, OFF))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

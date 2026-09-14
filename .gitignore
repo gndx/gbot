@@ -1,0 +1,27 @@
+# Host tooling and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*.mpy
+artifacts/
+vendor/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Local credentials and hardware snapshots must stay private.
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+calendar.json
+claude-retry.json
+state.txt
+limits.txt
+*.log
+*.backup
+*-backup.bin
+*.uf2
+*.bin

@@ -1,0 +1,4 @@
+# Host tools for Python >=3.10. Match mpy-cross to MicroPython 1.29 on the board.
+mpremote==1.29.0
+mpy-cross==1.29.0.post2
+pyserial==3.5

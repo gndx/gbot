@@ -38,6 +38,10 @@ with a **240 × 240 GC9A01A round display** and **QMI8658 motion sensor**.
 Start with its [official documentation](https://www.waveshare.com/wiki/RP2040-LCD-1.28)
 and [schematic](https://files.waveshare.com/upload/6/60/RP2040-LCD-1.28-sch.pdf).
 
+**Get the board:** [Waveshare RP2040-LCD-1.28 on Amazon](https://link.amazon/B064HyMa0).
+**Reference price: US$22.90**, shared by the maintainer; check the listing for
+current pricing.
+
 | Component | Current scope |
 | --- | --- |
 | Firmware | MicroPython on the Waveshare RP2040-LCD-1.28 |

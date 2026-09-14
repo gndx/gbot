@@ -5,6 +5,15 @@ documents the RP2040 MCU, 264 KB SRAM, 2 MB flash, 240 × 240 GC9A01A LCD,
 QMI8658 IMU, USB-C connector, and BOOT/RESET buttons in the
 [official board wiki](https://www.waveshare.com/wiki/RP2040-LCD-1.28).
 
+## Get the board
+
+[Buy the Waveshare RP2040-LCD-1.28 on Amazon](https://link.amazon/B064HyMa0)
+using the maintainer's link. The board has a 1.28-inch round IPS display,
+240 × 240 resolution, a dual-core RP2040 processor, a six-axis IMU, and USB-C.
+
+**Reference price: US$22.90**, shared by the maintainer; check the listing for
+current pricing.
+
 ## Pin map used by the firmware
 
 The following is the map implemented in `firmware/gc9a01.py` and

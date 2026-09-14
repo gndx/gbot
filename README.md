@@ -42,6 +42,8 @@ and [schematic](https://files.waveshare.com/upload/6/60/RP2040-LCD-1.28-sch.pdf)
 **Reference price: US$22.90**, shared by the maintainer; check the listing for
 current pricing.
 
+**3D-printable enclosure:** [GBOT model on MakerWorld](https://makerworld.com/es/models/3306700-gbot-waveshare-rp2040-mcu-board#profileId-3753545).
+
 | Component | Current scope |
 | --- | --- |
 | Firmware | MicroPython on the Waveshare RP2040-LCD-1.28 |

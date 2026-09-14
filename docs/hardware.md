@@ -14,6 +14,12 @@ using the maintainer's link. The board has a 1.28-inch round IPS display,
 **Reference price: US$22.90**, shared by the maintainer; check the listing for
 current pricing.
 
+## 3D-printable enclosure
+
+The maintainer's [GBOT enclosure model on MakerWorld](https://makerworld.com/es/models/3306700-gbot-waveshare-rp2040-mcu-board#profileId-3753545)
+is a 3D-printing resource for the Waveshare RP2040-LCD-1.28. The link includes
+the model's print profile.
+
 ## Pin map used by the firmware
 
 The following is the map implemented in `firmware/gc9a01.py` and

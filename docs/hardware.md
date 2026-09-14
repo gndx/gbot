@@ -20,6 +20,14 @@ The maintainer's [GBOT enclosure model on MakerWorld](https://makerworld.com/es/
 is a 3D-printing resource for the Waveshare RP2040-LCD-1.28. The link includes
 the model's print profile.
 
+![GBOT running in its black 3D-printed enclosure with red eyes and a red status ring](assets/gbot-enclosure.png)
+
+*The printed enclosure with the board installed and powered over USB-C.*
+
+![Two brick-built robots using GBOT enclosures, with the right robot's display powered on](assets/gbot-enclosure-builds.jpg)
+
+*Example robot builds using the enclosure.*
+
 ## Pin map used by the firmware
 
 The following is the map implemented in `firmware/gc9a01.py` and

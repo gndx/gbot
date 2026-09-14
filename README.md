@@ -42,8 +42,6 @@ and [schematic](https://files.waveshare.com/upload/6/60/RP2040-LCD-1.28-sch.pdf)
 **Reference price: US$22.90**, shared by the maintainer; check the listing for
 current pricing.
 
-**3D-printable enclosure:** [GBOT model on MakerWorld](https://makerworld.com/es/models/3306700-gbot-waveshare-rp2040-mcu-board#profileId-3753545).
-
 | Component | Current scope |
 | --- | --- |
 | Firmware | MicroPython on the Waveshare RP2040-LCD-1.28 |
@@ -58,6 +56,18 @@ updates come from the host computer. GBOT is a standalone extraction of the
 original HEX project. Its inherited design was developed for this board;
 repackaging and host tests do not establish that every GBOT revision has been
 flashed or visually checked. See the [validation checklist](docs/development.md#device-validation).
+
+## 3D-printable enclosure
+
+[Get the GBOT enclosure model and print profile on MakerWorld](https://makerworld.com/es/models/3306700-gbot-waveshare-rp2040-mcu-board#profileId-3753545).
+
+![GBOT running in its black 3D-printed enclosure with red eyes and a red status ring](docs/assets/gbot-enclosure.png)
+
+*The printed enclosure with the board installed and powered over USB-C.*
+
+![Two brick-built robots using GBOT enclosures, with the right robot's display powered on](docs/assets/gbot-enclosure-builds.jpg)
+
+*Example robot builds using the enclosure.*
 
 ## Get started
 
